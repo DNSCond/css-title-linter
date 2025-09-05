@@ -1,0 +1,23 @@
+{
+  "private": true,
+  "name": "css-title-linter",
+  "version": "0.0.0",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "dependencies": {
+    "@devvit/public-api": "0.12.0",
+    "anthelpers": "^0.0.3",
+    "css": "^3.0.0",
+    "css-tree": "^3.1.0",
+    "install": "^0.13.0",
+    "w3c-css-validator": "^1.4.0",
+    "@xmldom/xmldom": "^0.8.11",
+    "xml2js": "^0.6.2",
+    "xpath": "^0.0.34"
+  },
+  "devDependencies": {
+    "@types/css": "^0.0.38",
+    "@types/css-tree": "^2.3.10",
+    "typescript": "5.8.3"
+  }
+}
