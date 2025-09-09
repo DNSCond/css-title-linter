@@ -1,17 +1,23 @@
-import { Devvit } from '@devvit/public-api';
-import { indent_codeblock, jsonEncode } from 'anthelpers';
-import { DOMParser } from "@xmldom/xmldom";
-import xpath from "xpath";
-import { markdown_escape } from "anthelpers";
+import { Devvit, TriggerContext } from '@devvit/public-api';
+import { jsonEncodeIndent, markdown_escape } from 'anthelpers';
+import { CustomError } from './customError.js';
 
 Devvit.configure({
   redditAPI: true,
+  redis: true,
   http: {
     domains: ['jigsaw.w3.org'],
   }
 });
 
 Devvit.addSettings([
+  {
+    type: 'boolean',
+    name: 'working',
+    label: 'should work',
+    helpText: 'if you want to temporalily disable the bot',
+    defaultValue: false,
+  },
   {
     type: 'boolean',
     name: 'reportIfIncorrect',
@@ -26,25 +32,46 @@ Devvit.addSettings([
   // },
 ]);
 
+async function submitCommentAndDistinguish(context: TriggerContext, id: string, text: string, distinguish: boolean = true) {
+  const comment = await context.reddit.submitComment({ id, text });
+  if (distinguish) await comment.distinguish(true);
+  return comment;
+}
+
+
 type validateCSSResponse = { warningcount: number, errorcount: number, errors: string[], warns: string[] };
 function validateCSS(text: string, appVersion?: string): Promise<validateCSSResponse> {
-  const domParser = new DOMParser(), ua = typeof appVersion === 'string' ? `css-title-linter/${appVersion}` : 'css-title-linter';
-  return fetch(`https://jigsaw.w3.org/css-validator/validator?text=${encodeURIComponent(text)}&output=soap12&warning=1`, {
+  const ua = typeof appVersion === 'string' ? `css-title-linter/${appVersion}` : 'css-title-linter';
+  return fetch(`https://jigsaw.w3.org/css-validator/validator?text=${encodeURIComponent(text)}&output=application%2fjson&warning=1`, {
     headers: { 'user-agent': ua },
+  }).then(r => r, r => r).then(function (response) {
+    if (!(response instanceof Response))
+      throw new CustomError(`the return value isnt a response`, response);
+    console.log('response.headers', response.status, Object.fromEntries(response.headers.entries()));
+    if (!response.ok)
+      throw new CustomError(`Response (${response.status}) is not ok`, response);
+    return response;
+  }, function (thisShouldNotHAppen) {
+    console.error('thisShouldNotHAppen', thisShouldNotHAppen);
+    throw thisShouldNotHAppen;
   }).then(response => response.text()).then(function (resptext) {
-    // console.log(resptext);
-    return resptext;
-  }).then(dom => domParser.parseFromString(dom)).then(function (doc) {
-    // @ts-ignore
-    const warnings = +xpath.select("//*[local-name()='warningcount']/text()", doc)[0].data;// @ts-ignore
-    const errorcount = +xpath.select("//*[local-name()='errorcount']/text()", doc)[0].data;
-    let warns = xpath.select("//*[local-name()='warning']", doc);
-    let errors = xpath.select("//*[local-name()='error']", doc);// @ts-ignore
-    errors = errors.map(error => xpath.select('*[local-name()=\'message\']/text()', error)[0]?.data ?? null);// @ts-ignore
-    warns = warns.map(warnin => xpath.select('*[local-name()=\'message\']/text()', warnin)[0]?.data ?? null);// @ts-ignore
-    errors = errors.filter(mixed => mixed !== null).map(error => dedent(error.toString()));// @ts-ignore
-    warns = warns.filter(mixed => mixed !== null).map(warnin => dedent(warnin.toString()));
-    const warningcount = warnings;// @ts-expect-errors
+    const respjson = JSON.parse(resptext).cssvalidation;
+    if (respjson === undefined) throw new CustomError('resptext is not json, or \'cssvalidation\' is undefined', { respjson, resptext });
+    return respjson;
+  }).then(function (doc: any) {
+    let { warningcount, errorcount } = doc.result;
+    warningcount = +warningcount; errorcount = +errorcount;
+    const errors: string[] = [], warns: string[] = [];
+    if ('errors' in doc) {
+      for (const element of doc.errors) {
+        errors.push(element.message as string);
+      }
+    }
+    if ('warnings' in doc) {
+      for (const element of doc.warnings) {
+        warns.push(element.message as string);
+      }
+    }
     return { warningcount, errorcount, errors, warns } as validateCSSResponse;
   });
 }
@@ -78,23 +105,53 @@ function respondCSS(text: string): Promise<{ text: string, isValid: boolean }> {
 Devvit.addTrigger({
   event: 'PostSubmit',
   onEvent: async function (event, context) {
-    if (event?.post === undefined) return;
+    const authorId = event.author?.id;
+    if (event?.post === undefined || authorId === undefined) {
+      return;
+    }
     // Get the post title from the event
     const postTitle = event.post.title;
+    const postId = event.post.id;
+
+    const key = `post_submit_authorId:${authorId}`;
+    if (await context.redis.get(key)) {
+      const text = 'im limiting myself to you to not 429 the provider';
+      await submitCommentAndDistinguish(context, postId, text, true);
+      return;
+    }
+
+    const submittedAt = (new Date(event.post.createdAt ?? Date.now())).toISOString();
+    const value = JSON.stringify({ authorId, submittedAt, postId });
+    let ratelimit: string | undefined;
+    if (ratelimit = await context.redis.get('subreddit-ratelimit')) {
+      const ratelimitJS = JSON.parse(ratelimit) as { submittedAt: string };
+      const diff = Math.abs(Date.now() - Date.parse(ratelimitJS.submittedAt));
+      if (diff < 15) {
+        const text = 'im limiting myself to the subreddit to not 429 the provider';
+        await submitCommentAndDistinguish(context, postId, text, true);
+        return;
+      }else if(!isFinite(diff)){
+        const text = 'im limiting myself to the subreddit to not 429 the provider';
+        await submitCommentAndDistinguish(context, postId, text, true);
+      }
+    }
+    await context.redis.set('subreddit-ratelimit', JSON.stringify({ submittedAt }));
+    await context.redis.expire('subreddit-ratelimit', 10800*3);// 9 hours (3h * 3)
+
+    await context.redis.set(key, value);
+    await context.redis.expire(key, 17);// 3 hours
+    const reportIfIncorrect = Boolean(await context.settings.get('reportIfIncorrect'));
     let { text, isValid } = await respondCSS(postTitle);
-    // console.log(text);
 
     //text = `${text}\n\n---\n\n${indent_codeblock(text)}`;
     text += '\n\nif i got anything incorrect either blame [the checker](https://jigsaw.w3.org/css-validator/)';
     text += ' or my creator. im using a diffrent validator than my previous';
-    await (await context.reddit.submitComment({
-      id: event.post.id, text,
-    })).distinguish(true);
-    if (!isValid && await context.settings.get('reportIfIncorrect')) {
-      const reason = 'This post contains Invalid CSS in the title',
-        reportablePost = context.reddit.getPostById(event.post.id);
-      await context.reddit.report(await reportablePost, { reason });
-    }
+    await submitCommentAndDistinguish(context, postId, text, true);
+    // if (!isValid && reportIfIncorrect) {
+    //   const reason = 'This post contains Invalid CSS in the title',
+    //     reportablePost = context.reddit.getPostById(event.post.id);
+    //   await context.reddit.report(await reportablePost, { reason });
+    // }
   },
 });
 
@@ -103,46 +160,6 @@ function dedent(string?: string) {
   return string.trimEnd().replaceAll(/^\s+/gm, '');
 }
 
-// Devvit.addMenuItem({
-//   location: 'subreddit',
-//   label: 'check String',
-//   forUserType: 'moderator',
-//   description: 'Test the Filter',
-//   async onPress(_event, context: Devvit.Context) {
-//     context.ui.showForm(checkString);
-//     // const currentUser = await context.reddit.getCurrentUsername();
-//     // if (currentUser === undefined) return context.ui.showToast(`there is no currentUser`);
-//   },
-// });
-
-// const checkString = Devvit.createForm(
-//   {
-//     fields: [
-//       {
-//         type: 'paragraph',
-//         name: 'testString',
-//         label: 'test string',
-//         required: true,
-//       },
-//     ],
-//     title: 'Test the Filter',
-//     acceptLabel: 'Test',
-//   },
-//   async function (event, context: Devvit.Context) {
-//     const { testString } = event.values;
-//     try {
-//       '.example { world: "!" }'
-//       const ast = await validateCSS(testString);
-//       console.log(jsonEncode({ ast }, 2));
-
-//       context.ui.showToast('Yes')
-//       // do things with result.report, result.errored, and result.results
-//     } catch (err) {
-//       // do things with err e.g.
-//       console.error((err as Error).message);
-//       context.ui.showToast('No')
-//     }
-//   }
-// );
-
 export default Devvit;
+
+// function JSONPrettyPrint(mixed, indent = 2) {return JSON.stringify(JSON.parse(mixed), null, indent);}
