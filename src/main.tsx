@@ -11,13 +11,13 @@ Devvit.configure({
 });
 
 Devvit.addSettings([
-  {
-    type: 'boolean',
-    name: 'working',
-    label: 'should work',
-    helpText: 'if you want to temporalily disable the bot',
-    defaultValue: false,
-  },
+  // {
+  //   type: 'boolean',
+  //   name: 'working',
+  //   label: 'should work',
+  //   helpText: 'if you want to temporalily disable the bot',
+  //   defaultValue: false,
+  // },
   {
     type: 'boolean',
     name: 'reportIfIncorrect',
@@ -147,11 +147,11 @@ Devvit.addTrigger({
     text += '\n\nif i got anything incorrect either blame [the checker](https://jigsaw.w3.org/css-validator/)';
     text += ' or my creator. im using a diffrent validator than my previous';
     await submitCommentAndDistinguish(context, postId, text, true);
-    // if (!isValid && reportIfIncorrect) {
-    //   const reason = 'This post contains Invalid CSS in the title',
-    //     reportablePost = context.reddit.getPostById(event.post.id);
-    //   await context.reddit.report(await reportablePost, { reason });
-    // }
+    if (!isValid && reportIfIncorrect) {
+      const reason = 'This post contains Invalid CSS in the title',
+        reportablePost = context.reddit.getPostById(event.post.id);
+      await context.reddit.report(await reportablePost, { reason });
+    }
   },
 });
 
